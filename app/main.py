@@ -10,6 +10,7 @@ from .negotiation import (
     AcceptLanguageError,
     ParticipantHeaderError,
     SampleHeaderError,
+    analyze_q_stability,
     negotiate,
     negotiate_group,
     plan_coverage,
@@ -22,6 +23,7 @@ from .schemas import (
     HealthResponse,
     NegotiationRequest,
     NegotiationResponse,
+    QStabilityResponse,
 )
 app = FastAPI(
     title="HTTP 语言协商解释 API",
@@ -143,6 +145,34 @@ async def negotiate_language(
 
 
 @app.post(
+    "/api/v1/negotiate/q-stability",
+    response_model=QStabilityResponse,
+    tags=["语言协商"],
+    summary="单范围偏好权重稳定区间分析",
+)
+async def negotiate_q_stability(
+    payload: NegotiationRequest,
+) -> JSONResponse:
+    result = analyze_q_stability(
+        header=payload.accept_language,
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        locale_fallbacks=payload.locale_fallbacks,
+    )
+    baseline = NegotiationResponse.model_validate(result["baseline"])
+    if baseline.locale_fallback is None:
+        # Match /negotiate: the key is dropped rather than emitted null.
+        baseline_body = baseline.model_dump(exclude={"locale_fallback"})
+    else:
+        baseline_body = baseline.model_dump()
+    body = {
+        "baseline": baseline_body,
+        "ranges": result["ranges"],
+    }
+    return JSONResponse(content=body)
+
+
+@app.post(
     "/api/v1/negotiate/group",
     response_model=GroupNegotiationResponse,
     tags=["语言协商"],
@@ -186,5 +216,6 @@ async def root() -> dict[str, str]:
         "docs": "/docs",
         "health": "/health",
         "negotiate": "POST /api/v1/negotiate",
+        "negotiate_q_stability": "POST /api/v1/negotiate/q-stability",
         "negotiate_group": "POST /api/v1/negotiate/group",
     }

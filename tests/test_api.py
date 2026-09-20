@@ -281,6 +281,170 @@ def test_locale_fallback_must_be_object_422():
     assert response.status_code == 422
 
 
+def _post_q_stability(payload):
+    return client.post("/api/v1/negotiate/q-stability", json=payload)
+
+
+def test_q_stability_success():
+    response = _post_q_stability(
+        {
+            "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # The baseline is the existing single-person negotiation result.
+    assert body["baseline"]["selected_language"] == "zh-CN"
+    assert body["baseline"]["fallback"] is False
+    assert "locale_fallback" not in body["baseline"]
+    ranges = body["ranges"]
+    assert [r["range"] for r in ranges] == ["zh-cn", "zh", "en", "*"]
+    assert [r["position"] for r in ranges] == [1, 2, 3, 4]
+    assert [r["original_q"] for r in ranges] == [1.0, 0.9, 0.8, 0.5]
+    first = ranges[0]
+    assert first["lower_bound"] == 0.9
+    assert first["upper_bound"] == 1.0
+    assert first["upper_outside"] is None
+    assert first["lower_outside"] == {
+        "q": 0.899,
+        "selected_language": "zh-TW",
+        "fallback": False,
+    }
+
+
+def test_q_stability_interval_contains_original_q():
+    response = _post_q_stability(
+        {
+            "accept_language": "en;q=0.333",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    report = response.json()["ranges"][0]
+    assert report["lower_bound"] <= report["original_q"] <= report["upper_bound"]
+    # Only one positive-q concrete range: the result cannot change by
+    # moving its q anywhere in 0.001..1.000.
+    assert report["lower_bound"] == 0.001
+    assert report["upper_bound"] == 1.0
+    assert report["upper_outside"] is None
+    assert report["lower_outside"]["fallback"] is True
+
+
+def test_q_stability_deduplicated_ranges_keep_first_position():
+    response = _post_q_stability(
+        {
+            "accept_language": "de;q=0.9,en;q=0.1,en;q=0.5,*;q=0.05",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    body = response.json()
+    # Duplicate second en is ignored by negotiate and absent from reports.
+    assert [r["range"] for r in body["ranges"]] == ["de", "en", "*"]
+    en_report = body["ranges"][1]
+    assert en_report["position"] == 2
+    assert en_report["original_q"] == 0.1
+
+
+def test_q_stability_blank_header_empty_ranges():
+    response = _post_q_stability(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ranges"] == []
+    assert body["baseline"]["fallback"] is True
+    assert body["baseline"]["fallback_reason"] == "no-valid-range"
+
+
+def test_q_stability_wildcard_outside_point_shows_fallback():
+    response = _post_q_stability(
+        {
+            "accept_language": "*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    report = response.json()["ranges"][0]
+    assert report["range"] == "*"
+    assert report["lower_bound"] == 0.001
+    assert report["lower_outside"] == {
+        "q": 0.0,
+        "selected_language": "en-US",
+        "fallback": True,
+    }
+
+
+def test_q_stability_locale_fallback_baseline_key_present():
+    response = _post_q_stability(
+        {
+            "accept_language": "gsw;q=0.9,fr;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {
+                "gsw": "de",
+                "de": "zh-TW",
+                "fr": "ja-JP",
+            },
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["baseline"]["locale_fallback"]["selected_language"] == "zh-TW"
+    gsw = body["ranges"][0]
+    # The chain follows the highest-q positive source: while gsw stays
+    # at or above fr's 0.5 it reaches zh-TW (header order wins the tie);
+    # below that fr takes over and its chain ends at ja-JP.
+    assert gsw["lower_bound"] == 0.5
+    assert gsw["upper_bound"] == 1.0
+    assert gsw["lower_outside"] == {
+        "q": 0.499,
+        "selected_language": "ja-JP",
+        "fallback": False,
+    }
+
+
+def test_q_stability_invalid_header_returns_422():
+    response = _post_q_stability(
+        {
+            "accept_language": "en;q=2",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_q_stability_default_not_in_supported_returns_422():
+    response = _post_q_stability(
+        {
+            "accept_language": "en",
+            "supported_languages": SUPPORTED,
+            "default_language": "fr-FR",
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_q_stability_extra_field_rejected_422():
+    response = _post_q_stability(
+        {
+            "supported_languages": ["en"],
+            "default_language": "en",
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
 def _post_group(payload):
     return client.post("/api/v1/negotiate/group", json=payload)
 

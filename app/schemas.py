@@ -186,6 +186,45 @@ class NegotiationResponse(BaseModel):
     locale_fallback: LocaleFallbackReport | None = None
 
 
+class QStabilityBoundaryPoint(BaseModel):
+    """Outcome at the first legal q grid point just outside a stable interval."""
+
+    q: float = Field(description="区间外相邻网格点的权重（三位小数）")
+    selected_language: str = Field(description="该网格点重新协商后选中的语言")
+    fallback: bool = Field(description="该网格点重新协商后是否回退到默认语言")
+
+
+class QStabilityRangeReport(BaseModel):
+    """Stable-q interval for one de-duplicated language range."""
+
+    range: str = Field(description="去重后的语言范围（小写；可能为 '*' 通配符）")
+    position: int = Field(
+        description="该范围在原始 Accept-Language 头中的位置（从 1 开始）"
+    )
+    original_q: float = Field(description="该范围在原始请求中的 q（必在稳定区间内）")
+    lower_bound: float = Field(
+        description="保持 selected_language 与 fallback 均不变的最大连续区间下界（含）"
+    )
+    upper_bound: float = Field(
+        description="保持 selected_language 与 fallback 均不变的最大连续区间上界（含）"
+    )
+    lower_outside: QStabilityBoundaryPoint | None = Field(
+        description="紧邻下界之外的网格点结果；下界已是 0.000 时为 null"
+    )
+    upper_outside: QStabilityBoundaryPoint | None = Field(
+        description="紧邻上界之外的网格点结果；上界已是 1.000 时为 null"
+    )
+
+
+class QStabilityResponse(BaseModel):
+    baseline: NegotiationResponse = Field(
+        description="按现有规则得到的基准单人协商结果（与 /negotiate 完全一致）"
+    )
+    ranges: list[QStabilityRangeReport] = Field(
+        description="去重后每个语言范围各自的权重稳定区间（按头部顺序）"
+    )
+
+
 class GroupParticipant(BaseModel):
     """One group member: a unique id plus their raw Accept-Language header."""
 

@@ -7,6 +7,7 @@ from app.negotiation import (
     LocaleFallbackError,
     ParticipantHeaderError,
     SampleHeaderError,
+    analyze_q_stability,
     negotiate,
     negotiate_group,
     normalize_fallbacks,
@@ -647,3 +648,318 @@ class TestCoveragePlan:
         exc = excinfo.value
         assert isinstance(exc, AcceptLanguageError)
         assert exc.position == 2
+
+
+class TestQStability:
+    def test_baseline_matches_negotiate(self):
+        result = analyze_q_stability(
+            header="zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            supported=["en-US", "zh-CN", "zh-TW", "ja-JP"],
+            default="en-US",
+        )
+        expected = negotiate(
+            header="zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            supported=["en-US", "zh-CN", "zh-TW", "ja-JP"],
+            default="en-US",
+        )
+        assert result["baseline"] == expected
+        assert result["baseline"]["selected_language"] == "zh-CN"
+
+    def test_reports_one_entry_per_deduplicated_range_in_header_order(self):
+        result = analyze_q_stability(
+            header="en;q=0.5,EN;q=0.2, zh;q=0.8,*;q=0.1",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+        )
+        assert [
+            (r["range"], r["position"], r["original_q"])
+            for r in result["ranges"]
+        ] == [
+            ("en", 1, 0.5),
+            ("zh", 3, 0.8),
+            ("*", 4, 0.1),
+        ]
+
+    def test_winner_range_interval_breaks_at_tie_point(self):
+        # zh-CN (q=1) beats zh-TW (matched via zh;q=0.9) while strictly
+        # greater; at 0.9 the server-order tiebreak flips to zh-TW.
+        result = analyze_q_stability(
+            header="zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            supported=["en-US", "zh-CN", "zh-TW", "ja-JP"],
+            default="en-US",
+        )
+        report = result["ranges"][0]
+        assert report["range"] == "zh-cn"
+        assert report["original_q"] == 1.0
+        assert report["lower_bound"] == 0.9
+        assert report["upper_bound"] == 1.0
+        assert report["upper_outside"] is None
+        assert report["lower_outside"] == {
+            "q": 0.899,
+            "selected_language": "zh-TW",
+            "fallback": False,
+        }
+
+    def test_competitor_range_interval_breaks_when_it_takes_over(self):
+        # en-US (en;q=0.8) loses to zh-CN (zh;q=0.9); since en-US is the
+        # earliest supported tag it wins the tie once en reaches q=0.9.
+        result = analyze_q_stability(
+            header="zh;q=0.9,en;q=0.8,*;q=0.5",
+            supported=["en-US", "zh-CN", "zh-TW"],
+            default="en-US",
+        )
+        report = next(r for r in result["ranges"] if r["range"] == "en")
+        assert report["lower_bound"] == 0.0
+        assert report["upper_bound"] == 0.899
+        assert report["lower_outside"] is None
+        assert report["upper_outside"] == {
+            "q": 0.9,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_wildcard_q_zero_exclusion_boundary(self):
+        # With only "*;q=0.5" every candidate is wildcard-matched and
+        # en-US wins normally; at q=0 all are excluded -> default fallback.
+        result = analyze_q_stability(
+            header="*;q=0.5",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+        )
+        report = result["ranges"][0]
+        assert report["range"] == "*"
+        assert report["lower_bound"] == 0.001
+        assert report["upper_bound"] == 1.0
+        assert report["upper_outside"] is None
+        assert report["lower_outside"] == {
+            "q": 0.0,
+            "selected_language": "en-US",
+            "fallback": True,
+        }
+
+    def test_concrete_q_zero_range_original_point_is_at_zero(self):
+        # Only the default tag en-US matches, and it is q=0-excluded, so
+        # the baseline falls back; the moment en gets any positive weight
+        # it wins normally (fallback flips), making 0.000 a stable point.
+        result = analyze_q_stability(
+            header="en;q=0",
+            supported=["en-US", "fr-FR"],
+            default="en-US",
+        )
+        report = next(r for r in result["ranges"] if r["range"] == "en")
+        assert result["baseline"]["selected_language"] == "en-US"
+        assert result["baseline"]["fallback"] is True
+        assert report["original_q"] == 0.0
+        assert report["lower_bound"] == 0.0
+        assert report["upper_bound"] == 0.0
+        assert report["lower_outside"] is None
+        assert report["upper_outside"] == {
+            "q": 0.001,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_truncation_matching_via_negotiate(self):
+        # Raising zh-Hant's q above the zh-CN direct q moves the winner;
+        # zh-Hant matches zh-Hant-TW via truncation, just like negotiate().
+        result = analyze_q_stability(
+            header="zh-CN;q=0.8,zh-Hant;q=0.7",
+            supported=["en-US", "zh-CN", "zh-Hant-TW"],
+            default="en-US",
+        )
+        report = next(r for r in result["ranges"] if r["range"] == "zh-hant")
+        assert result["baseline"]["selected_language"] == "zh-CN"
+        assert report["lower_bound"] == 0.0
+        assert report["upper_bound"] == 0.8
+        assert report["upper_outside"] == {
+            "q": 0.801,
+            "selected_language": "zh-Hant-TW",
+            "fallback": False,
+        }
+
+    def test_locale_fallback_state_changes_at_q_zero(self):
+        # The gsw chain selects zh-TW for every strictly positive q;
+        # q=0 removes the positive source range -> default fallback.
+        result = analyze_q_stability(
+            header="gsw;q=0.9",
+            supported=["en-US", "zh-TW"],
+            default="en-US",
+            locale_fallbacks={"gsw": "zh-TW"},
+        )
+        report = result["ranges"][0]
+        assert result["baseline"]["selected_language"] == "zh-TW"
+        assert result["baseline"]["fallback"] is False
+        assert report["lower_bound"] == 0.001
+        assert report["upper_bound"] == 1.0
+        assert report["lower_outside"] == {
+            "q": 0.0,
+            "selected_language": "en-US",
+            "fallback": True,
+        }
+
+    def test_blank_header_has_no_range_reports(self):
+        result = analyze_q_stability(
+            header=None,
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+        )
+        assert result["ranges"] == []
+        assert result["baseline"]["fallback"] is True
+        assert result["baseline"]["fallback_reason"] == "no-valid-range"
+
+    def test_invalid_header_raises(self):
+        with pytest.raises(AcceptLanguageError):
+            analyze_q_stability(
+                header="en;q=2",
+                supported=["en-US"],
+                default="en-US",
+            )
+
+    def test_other_ranges_keep_original_tokens_during_scan(self):
+        # The scanned element keeps its raw spelling; a duplicate later
+        # occurrence remains ignored (negotiate dedupes) and a wildcard
+        # keeps its own q throughout the scan.
+        result = analyze_q_stability(
+            header="en;q=0.5,en;q=0.2,*;q=0.5",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+        )
+        report = next(r for r in result["ranges"] if r["range"] == "en")
+        # en-US baseline-wins over the wildcard tie only by concreteness;
+        # lowering en below 0.5 lets the wildcard candidate zh-CN win.
+        assert report["lower_bound"] == 0.5
+        assert report["lower_outside"] == {
+            "q": 0.499,
+            "selected_language": "zh-CN",
+            "fallback": False,
+        }
+        assert [r["range"] for r in result["ranges"]] == ["en", "*"]
+
+    def test_intervals_match_brute_force_with_locale_chains(self):
+        header = "gsw;q=0.9,fr;q=0.5"
+        supported = ["en-US", "zh-TW", "ja-JP"]
+        default = "en-US"
+        chains = {"gsw": "de", "de": "zh-TW", "fr": "ja-JP"}
+        result = analyze_q_stability(
+            header=header,
+            supported=supported,
+            default=default,
+            locale_fallbacks=chains,
+        )
+        parsed = parse_accept_language(header)
+        elements = header.split(",")
+        base_key = (
+            result["baseline"]["selected_language"],
+            result["baseline"]["fallback"],
+        )
+
+        for entry, report in zip(parsed, result["ranges"]):
+            def brute(step: int) -> tuple[str, bool]:
+                token = f"{step // 1000}.{step % 1000:03d}"
+                parts = elements[entry.position - 1].split(";")
+                head, _sep, _value = parts[1].partition("=")
+                parts[1] = head + "=" + token
+                rewritten = ",".join(
+                    elements[: entry.position - 1]
+                    + [";".join(parts)]
+                    + elements[entry.position :]
+                )
+                outcome = negotiate(
+                    rewritten, supported, default, locale_fallbacks=chains
+                )
+                return outcome["selected_language"], outcome["fallback"]
+
+            original_step = round(entry.q * 1000)
+            lower = original_step
+            while lower - 1 >= 0 and brute(lower - 1) == base_key:
+                lower -= 1
+            upper = original_step
+            while upper + 1 <= 1000 and brute(upper + 1) == base_key:
+                upper += 1
+            assert report["lower_bound"] == lower / 1000
+            assert report["upper_bound"] == upper / 1000
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            "en;q=0,*;q=0.6",
+            "*;q=0.5",
+            "en;q=0",
+            "de;q=0.9,en;q=0.1,*;q=0.05",
+            "zh-CN;q=0.8,zh-TW;q=0.799",
+            "fr;q=0.333,de;q=0.334,en;q=0.333",
+        ],
+    )
+    def test_intervals_match_brute_force_grid_walk(self, header):
+        # Property test: the event-step optimization must return exactly
+        # what a literal scan of all 1001 grid points through negotiate()
+        # (rewriting the raw header element) would produce.
+        supported = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+        default = "en-US"
+        result = analyze_q_stability(
+            header=header, supported=supported, default=default
+        )
+        parsed = parse_accept_language(header)
+        elements = header.split(",")
+        base_key = (
+            result["baseline"]["selected_language"],
+            result["baseline"]["fallback"],
+        )
+
+        for entry, report in zip(parsed, result["ranges"]):
+            outcomes: dict[int, tuple[str, bool]] = {}
+
+            def brute_outcome(step: int) -> tuple[str, bool]:
+                if step not in outcomes:
+                    token = f"{step // 1000}.{step % 1000:03d}"
+                    parts = elements[entry.position - 1].split(";")
+                    replaced = False
+                    for idx in range(1, len(parts)):
+                        if (
+                            parts[idx].strip().split("=", 1)[0].strip()
+                            == "q"
+                        ):
+                            head, _sep, _value = parts[idx].partition("=")
+                            parts[idx] = head + "=" + token
+                            replaced = True
+                    if not replaced:
+                        parts.append(f"q={token}")
+                    rewritten = ",".join(
+                        elements[: entry.position - 1]
+                        + [";".join(parts)]
+                        + elements[entry.position :]
+                    )
+                    outcome = negotiate(rewritten, supported, default)
+                    outcomes[step] = (
+                        outcome["selected_language"],
+                        outcome["fallback"],
+                    )
+                return outcomes[step]
+
+            original_step = round(entry.q * 1000)
+            lower = original_step
+            while lower - 1 >= 0 and brute_outcome(lower - 1) == base_key:
+                lower -= 1
+            upper = original_step
+            while upper + 1 <= 1000 and brute_outcome(upper + 1) == base_key:
+                upper += 1
+
+            assert report["lower_bound"] == lower / 1000
+            assert report["upper_bound"] == upper / 1000
+
+            for side_step, actual in (
+                (lower - 1, report["lower_outside"]),
+                (upper + 1, report["upper_outside"]),
+            ):
+                if side_step < 0 or side_step > 1000:
+                    assert actual is None
+                else:
+                    selected, fell_back = brute_outcome(side_step)
+                    assert actual == {
+                        "q": side_step / 1000,
+                        "selected_language": selected,
+                        "fallback": fell_back,
+                    }
+                    # The reported outside point must differ from baseline.
+                    assert (selected, fell_back) != base_key

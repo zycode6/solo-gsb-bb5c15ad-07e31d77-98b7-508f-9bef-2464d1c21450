@@ -11,7 +11,10 @@ BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4
 traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷举所有不超过
 `max_additions`（1～3）个新增的候选子集，复用同一套协商语义计算每个子集可将多少
 流量从默认兜底转为正常命中，选出改善流量最大的方案（同分依次取新增数更少、
-候选输入序更早）。
+候选输入序更早）。`/api/v1/negotiate/q-stability` 提供**偏好权重稳定区间分析**：
+请求体与单人协商完全相同，服务端先给出基准协商结果，再对去重后的每个语言范围单独
+扫描 RFC 允许的 `0.000`～`1.000` 三位小数 q 网格，求出保持 `selected_language` 与
+`fallback` 状态均不变的最大连续区间，并报告越过边界后会得到什么结果。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -27,6 +30,7 @@ docker compose up -d --build
 | --- | --- |
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/q-stability | 偏好权重稳定区间分析接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
@@ -189,6 +193,128 @@ curl -X POST http://localhost:8000/api/v1/negotiate \
 - `locale_fallback`：**仅当 `locale_fallbacks` 链实际选中语言时出现**，记录触发源
   范围（`source_range`/`source_q`/`source_position`）、实际路径 `path`（小写标签，
   含起点与终点）与最终标签 `selected_language`；未触发时该键缺省。
+
+## 偏好权重稳定区间分析（POST /api/v1/negotiate/q-stability）
+
+当需要回答「某个语言范围的 q 在多大范围内调整，协商结果不会变？」时（例如评估
+客户端权重抖动、AB 调参的敏感度），使用稳定区间分析接口。**请求体与单人协商接口
+完全相同**（同样支持 `locale_fallbacks`，校验规则也一致）。服务端先按现有规则
+跑一次基准协商，再对**去重后的每个语言范围**单独扫描 RFC 9110 允许的
+**`0.000`～`1.000` 三位小数 q 网格**（共 1001 个点），扫描某一范围时**其余范围
+（含重复出现、通配符）的原始 q 与拼写保持不变**，求出：
+
+- **包含该范围原 q 的最大连续区间**，使得区间内每个网格点的 `selected_language`
+  与 `fallback` 状态都与基准完全一致；
+- 当区间外仍存在网格点时，给出**紧邻边界的第一个网格点**重新协商后的新
+  `selected_language` 与 `fallback`（该点的结果必然与基准不同）。
+
+通配符、RFC 4647 逐级截断匹配、`q=0` 排除与 `locale_fallbacks` 链全部**原样复用
+`/negotiate` 的协商逻辑**；非法 `Accept-Language` 头沿用现有 **422** 响应。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/q-stability \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US"
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "baseline": {
+    "selected_language": "zh-CN",
+    "selected_supported_index": 1,
+    "fallback": false,
+    "fallback_reason": null
+  },
+  "ranges": [
+    {
+      "range": "zh-cn",
+      "position": 1,
+      "original_q": 1.0,
+      "lower_bound": 0.9,
+      "upper_bound": 1.0,
+      "lower_outside": {"q": 0.899, "selected_language": "zh-TW", "fallback": false},
+      "upper_outside": null
+    },
+    {
+      "range": "zh",
+      "position": 2,
+      "original_q": 0.9,
+      "lower_bound": 0.0,
+      "upper_bound": 1.0,
+      "lower_outside": null,
+      "upper_outside": null
+    },
+    {
+      "range": "en",
+      "position": 3,
+      "original_q": 0.8,
+      "lower_bound": 0.0,
+      "upper_bound": 0.999,
+      "lower_outside": null,
+      "upper_outside": {"q": 1.0, "selected_language": "en-US", "fallback": false}
+    },
+    {
+      "range": "*",
+      "position": 4,
+      "original_q": 0.5,
+      "lower_bound": 0.0,
+      "upper_bound": 1.0,
+      "lower_outside": null,
+      "upper_outside": null
+    }
+  ]
+}
+```
+
+上例中：`zh-CN` 的 q 只要不低于 `zh;q=0.9`（含 0.9 的服务端顺序决胜）就始终选中
+`zh-CN`，降到 `0.899` 时赢家变为 `zh-TW`；`zh` 与 `*` 不参与冠军争夺，q 在整个
+网格上变化都不改变结果；`en` 升到 `1.000` 时会反超选出 `en-US`。
+
+### 稳定区间响应字段
+
+`baseline` 即**完整的基准单人协商结果**，结构与 `POST /api/v1/negotiate` 逐字段
+一致（`locale_fallback` 同样仅在链实际触发时出现）。`ranges[]` 按头部顺序为
+**去重后保留的每个范围**（含通配符 `*`）给出一条记录：
+
+| 字段 | 说明 |
+| --- | --- |
+| `range` | 去重后的语言范围（小写；可能为 `*`） |
+| `position` | 该范围在原始 `Accept-Language` 头中的位置（从 1 开始，重复范围只报第一次出现） |
+| `original_q` | 原始请求中的 q；恒有 `lower_bound ≤ original_q ≤ upper_bound` |
+| `lower_bound` / `upper_bound` | 稳定区间的下界 / 上界（**含端点**，均为合法三位小数网格点） |
+| `lower_outside` | 紧邻下界之外的网格点（`lower_bound - 0.001`）的新结果；下界已是 `0.000` 时为 `null` |
+| `upper_outside` | 紧邻上界之外的网格点（`upper_bound + 0.001`）的新结果；上界已是 `1.000` 时为 `null` |
+
+`lower_outside` / `upper_outside` 非 `null` 时只包含 `q`、`selected_language`、
+`fallback` 三个字段，且该点的语言或兜底状态必然与基准不同——这正是区间「最大」的
+含义。
+
+### 分析规则要点
+
+1. **基准优先**：先用未改动的请求头按现有规则协商一次；只有
+   `selected_language` 与 `fallback` **两者都不变**才算区间内的稳定点
+   （`fallback_reason`、`message`、候选轨迹等解释性字段不作为判稳条件）。
+2. **逐范围独立扫描**：每次只替换一个范围对应头部元素的 q 值，其余逗号分隔元素
+   **原样保留**；重复出现的范围仍由基准协商的「保留第一次出现」规则去重，因此只为
+   第一次出现生成区间报告。
+3. **`q=0` 不跳过**：`0.000` 是合法网格点并参与扫描。若原 q 就是 0（该范围处于
+   排除状态），稳定区间可以恰好是单点 `0.000`，此时 `upper_outside.q` 为
+   `0.001`；反之通配符/具体范围降到 `0.000` 导致全员被排除时，`lower_outside`
+   会显示回退默认语言（`fallback: true`）。
+4. **通配符与截断匹配**：扫描得到的每次协商都完整走现有 RFC 4647 lookup 与
+   q=0 排除逻辑，因此「具体范围优先于 `*`」「最长前缀命中」「服务端顺序决胜」
+   等规则在边界点上自然生效。
+5. **无有效范围**：请求头缺失/`null`/空白时 `ranges` 为空数组，`baseline` 为
+   默认兜底结果。
+6. **校验**：请求体校验与单人接口完全一致；非法头返回与 `/negotiate` 相同的
+   **422** 结构（`loc` 为 `["body","accept_language"]`，`type` 为
+   `accept_language.syntax_error`）。
 
 ## 群体协商（POST /api/v1/negotiate/group）
 
@@ -441,7 +567,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 114 个单元/接口测试
+pytest -q          # 142 个单元/接口测试
 ```
 
 ## 项目结构

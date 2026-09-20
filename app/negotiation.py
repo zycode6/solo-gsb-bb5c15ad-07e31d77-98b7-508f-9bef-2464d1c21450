@@ -31,6 +31,12 @@ Implements the negotiation rules required by the service:
   the most traffic from the default fallback to a normal hit wins,
   ties broken by fewer additions, then by earlier candidate input
   order.
+* :func:`analyze_q_stability` also reuses :func:`negotiate`: after a
+  baseline run it scans, for every de-duplicated range individually,
+  the full three-decimal q grid (``0.000``..``1.000``) while the other
+  ranges stay fixed, and reports the maximal contiguous grid interval
+  around the original q that keeps ``selected_language`` and the
+  fallback state unchanged.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -43,6 +49,10 @@ import re
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
+
+# RFC 9110 quality values carry at most three fractional digits, so the
+# legal q grid has 1001 points from 0.000 through 1.000 inclusive.
+Q_GRID_STEPS = 1000
 
 # RFC 5646 section 2.1 grammar (main tag grammar, no grandfathered tags).
 _PRIVATEUSE = r"x(?:-[0-9a-z]{1,8})+"
@@ -835,3 +845,214 @@ def plan_coverage(
         "message": message,
         "samples": sample_reports,
     }
+
+
+def analyze_q_stability(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Analyze how far each range's q may move without changing the outcome.
+
+    Runs :func:`negotiate` once for the baseline outcome, then for every
+    de-duplicated parsed range finds the maximal contiguous run of the
+    RFC 9110 three-decimal q grid (``0.000``..``1.000``) that contains
+    the range's original q and yields the same ``selected_language``
+    *and* ``fallback`` flag as the baseline.
+
+    Match resolution (concrete range vs wildcard vs nothing, truncation
+    prefixes, q=0 exclusion) depends only on the *tags*, never on q
+    values, so it is precomputed once per candidate; while scanning one
+    range's q, every other range keeps its parsed q. A grid step is then
+    evaluated by a lightweight mirror of :func:`negotiate`'s selection
+    logic (winner by q then server order, then the locale_fallbacks
+    chain, then the default fallback) that only reads the precomputed
+    matches -- no header is re-parsed. Moreover, as the scanned q moves,
+    the (selected_language, fallback) pair can change only when the
+    scanned weight crosses 0 or another range's weight (ties resolved at
+    equality), i.e. at a small set of event steps; the outcome is
+    constant between them, so at most O(number of ranges) grid points
+    per range need evaluating. Wildcards, truncation matching and q=0
+    exclusion are therefore the exact same rules; a missing/blank
+    header contains no ranges, so its stability report is empty.
+    """
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    parsed = parse_accept_language(header)
+    baseline_key = (baseline["selected_language"], baseline["fallback"])
+
+    chains = (
+        {source.lower(): target.lower() for source, target in locale_fallbacks.items()}
+        if locale_fallbacks
+        else {}
+    )
+    supported_lower_to_index = {
+        tag.lower(): index for index, tag in enumerate(supported)
+    }
+    default_index = _default_supported_index(supported, default)
+
+    # Per candidate, the effective range depends solely on the tags:
+    # (matched concrete entry or None, wildcard entry or None). Same
+    # precedence as negotiate(): concrete longest-prefix match beats *.
+    candidate_effective: list[tuple[LanguageRange | None, LanguageRange | None]] = []
+    for candidate in supported:
+        chain = truncation_chain(candidate)
+        matched, _prefix = _find_concrete_range(chain, parsed)
+        wildcard = _wildcard_range(parsed) if matched is None else None
+        candidate_effective.append((matched, wildcard))
+
+    def outcome(
+        ranges: list[LanguageRange],
+    ) -> tuple[str, bool]:
+        """Mirror of negotiate()'s winner/fallback decision on ranges."""
+
+        q_by_range = {entry.range: entry.q for entry in ranges}
+        eligible: list[tuple[float, int]] = []
+        for index, (matched, wildcard) in enumerate(candidate_effective):
+            if matched is not None:
+                q_value = q_by_range[matched.range]
+            elif wildcard is not None:
+                q_value = q_by_range["*"]
+            else:
+                continue
+            if q_value > 0:
+                eligible.append((q_value, index))
+            # q == 0 -> excluded, exactly like negotiate(): wildcard and
+            # concrete exclusions both keep the candidate out of the set.
+
+        selected_index: int | None = None
+        if eligible:
+            _q, selected_index = min(
+                eligible, key=lambda item: (-item[0], item[1])
+            )
+        elif chains:
+            zero_concrete = {
+                entry.range
+                for entry in ranges
+                if entry.range != "*" and entry.q == 0
+            }
+            positive = [
+                entry
+                for entry in ranges
+                if entry.range != "*" and entry.q > 0 and entry.range in chains
+            ]
+            positive.sort(key=lambda entry: (-entry.q, entry.position))
+            for source in positive:
+                visited: set[str] = {source.range}
+                node = source.range
+                while True:
+                    index = supported_lower_to_index.get(node)
+                    if index is not None:
+                        if (
+                            _concrete_q_zero_excluded(node, list(zero_concrete))
+                            is None
+                        ):
+                            selected_index = index
+                            break
+                        # Supported but explicitly excluded: keep walking,
+                        # mirroring _chain_fallback.
+                    nxt = chains.get(node)
+                    if nxt is None or nxt in visited:
+                        break
+                    visited.add(nxt)
+                    node = nxt
+                if selected_index is not None:
+                    break
+
+        if selected_index is None:
+            return supported[default_index], True
+        return supported[selected_index], False
+
+    def outcome_with_q(target: LanguageRange, q: float) -> tuple[str, bool]:
+        varied = LanguageRange(
+            range=target.range, q=q, position=target.position
+        )
+        ranges = [varied if entry is target else entry for entry in parsed]
+        return outcome(ranges)
+
+    # For a scanned range R with grid step s, every candidate's
+    # effective weight is either s (the candidate's effective range is
+    # R itself) or a constant taken from another range; eligibility also
+    # changes at s=0. The selected_language/fallback pair can therefore
+    # change only at step 0/1 and at grid steps adjacent to another
+    # range's weight crossing (s == q_other +/- 1, and s == q_other for
+    # ties). Between consecutive such event steps the outcome is
+    # constant, so the stable run is found by classifying the spans
+    # between sorted event steps instead of walking all 1001 points.
+    other_steps = sorted(
+        {round(other.q * Q_GRID_STEPS) for other in parsed}
+    )
+
+    range_reports: list[dict[str, Any]] = []
+    for entry in parsed:
+        original_step = round(entry.q * Q_GRID_STEPS)
+
+        event_steps = {0, 1, Q_GRID_STEPS, original_step}
+        for step in other_steps:
+            event_steps.add(step)
+            if step - 1 >= 0:
+                event_steps.add(step - 1)
+            if step + 1 <= Q_GRID_STEPS:
+                event_steps.add(step + 1)
+        ordered = sorted(event_steps)
+
+        def step_outcome(step: int) -> tuple[str, bool]:
+            return outcome_with_q(entry, step / Q_GRID_STEPS)
+
+        # Span k covers [ordered[k], ordered[k+1]) (last one ends at
+        # 1000 inclusive); its outcome is constant and equals the
+        # outcome evaluated at its first step.
+        starts = ordered
+        ends_exclusive = ordered[1:] + [Q_GRID_STEPS + 1]
+        span_stable = [
+            step_outcome(step) == baseline_key for step in starts
+        ]
+
+        origin_span = next(
+            k
+            for k, start in enumerate(starts)
+            if start <= original_step < ends_exclusive[k]
+        )
+        # The baseline was produced with the original q, so this span
+        # necessarily reproduces it.
+        assert span_stable[origin_span]
+
+        first_span = origin_span
+        while first_span > 0 and span_stable[first_span - 1]:
+            first_span -= 1
+        last_span = origin_span
+        while last_span + 1 < len(starts) and span_stable[last_span + 1]:
+            last_span += 1
+
+        lower = starts[first_span]
+        upper = ends_exclusive[last_span] - 1
+
+        def outside_point(step: int) -> dict[str, Any] | None:
+            if step < 0 or step > Q_GRID_STEPS:
+                return None
+            selected, fell_back = step_outcome(step)
+            return {
+                "q": step / Q_GRID_STEPS,
+                "selected_language": selected,
+                "fallback": fell_back,
+            }
+
+        range_reports.append(
+            {
+                "range": entry.range,
+                "position": entry.position,
+                "original_q": entry.q,
+                "lower_bound": lower / Q_GRID_STEPS,
+                "upper_bound": upper / Q_GRID_STEPS,
+                "lower_outside": outside_point(lower - 1),
+                "upper_outside": outside_point(upper + 1),
+            }
+        )
+
+    return {"baseline": baseline, "ranges": range_reports}
