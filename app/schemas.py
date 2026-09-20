@@ -186,6 +186,46 @@ class NegotiationResponse(BaseModel):
     locale_fallback: LocaleFallbackReport | None = None
 
 
+class StabilityOutsidePoint(BaseModel):
+    """Nearest grid point beyond a stability interval boundary."""
+
+    q: float = Field(
+        description="边界外紧邻的 q 网格点（0.001～1.000 三位小数）"
+    )
+    selected_language: str = Field(
+        description="在该网格点下新选中的服务端标签（保持原始大小写）"
+    )
+    fallback: bool = Field(description="在该网格点下是否回退到默认语言")
+
+
+class RangeStability(BaseModel):
+    """Stability interval for one de-duplicated language range."""
+
+    range: str = Field(description="去重后的语言范围（小写；可能为通配符 '*'）")
+    position: int = Field(
+        description="该范围在原始 Accept-Language 头中的序号（从 1 开始）"
+    )
+    original_q: float = Field(description="该范围在原始请求中的 q 值（可能为 0）")
+    lower_bound: float = Field(
+        description="包含原 q 的最大连续稳定区间下界（q=0 的范围下界为 0.0）"
+    )
+    upper_bound: float = Field(description="包含原 q 的最大连续稳定区间上界")
+    lower_outside: StabilityOutsidePoint | None = Field(
+        description="下界之外紧邻的网格点及其新结果；下界已到网格边缘（含 q=0）时为 null"
+    )
+    upper_outside: StabilityOutsidePoint | None = Field(
+        description="上界之外紧邻的网格点及其新结果；上界为 1.000 时为 null"
+    )
+
+
+class QStabilityResponse(NegotiationResponse):
+    """Baseline negotiation plus a per-range q stability interval report."""
+
+    ranges: list[RangeStability] = Field(
+        description="对去重后的每个语言范围单独扫描正 q 网格得到的稳定区间（按头部顺序）"
+    )
+
+
 class GroupParticipant(BaseModel):
     """One group member: a unique id plus their raw Accept-Language header."""
 

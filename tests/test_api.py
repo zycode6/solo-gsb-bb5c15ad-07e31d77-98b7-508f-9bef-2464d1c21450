@@ -281,6 +281,182 @@ def test_locale_fallback_must_be_object_422():
     assert response.status_code == 422
 
 
+def _post_q_stability(payload):
+    return client.post("/api/v1/negotiate/q-stability", json=payload)
+
+
+def test_q_stability_baseline_and_intervals():
+    response = _post_q_stability(
+        {
+            "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # The baseline part is the ordinary negotiation result.
+    assert body["selected_language"] == "zh-CN"
+    assert body["fallback"] is False
+    assert len(body["candidates"]) == 4
+    assert "locale_fallback" not in body
+
+    by_range = {entry["range"]: entry for entry in body["ranges"]}
+    assert set(by_range) == {"zh-cn", "zh", "en", "*"}
+    # Original positions survive de-duplication/ordering.
+    assert [entry["position"] for entry in body["ranges"]] == [1, 2, 3, 4]
+
+    zh_cn = by_range["zh-cn"]
+    assert zh_cn["original_q"] == 1.0
+    assert zh_cn["lower_bound"] == 0.9
+    assert zh_cn["upper_bound"] == 1.0
+    assert zh_cn["upper_outside"] is None
+    assert zh_cn["lower_outside"] == {
+        "q": 0.899,
+        "selected_language": "zh-TW",
+        "fallback": False,
+    }
+
+    # A range unable to change the outcome spans the whole grid and has
+    # no outside points on either side.
+    zh = by_range["zh"]
+    assert (zh["lower_bound"], zh["upper_bound"]) == (0.001, 1.0)
+    assert zh["lower_outside"] is None and zh["upper_outside"] is None
+
+
+def test_q_stability_q_zero_range_intervals():
+    response = _post_q_stability(
+        {
+            "accept_language": "en;q=0,zh;q=0.9",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    en = response.json()["ranges"][0]
+    assert en["range"] == "en"
+    assert en["original_q"] == 0.0
+    assert en["lower_bound"] == 0.0
+    assert en["lower_outside"] is None
+    assert en["upper_outside"] == {
+        "q": 0.9,
+        "selected_language": "en-US",
+        "fallback": False,
+    }
+
+
+def test_q_stability_wildcard_swept_and_q0_excluded():
+    response = _post_q_stability(
+        {
+            "accept_language": "zh;q=0.9,*;q=0.4",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    by_range = {entry["range"]: entry for entry in response.json()["ranges"]}
+    zh = by_range["zh"]
+    assert (zh["lower_bound"], zh["upper_bound"]) == (0.401, 1.0)
+    assert zh["lower_outside"] == {
+        "q": 0.4,
+        "selected_language": "en-US",
+        "fallback": False,
+    }
+    star = by_range["*"]
+    assert star["upper_outside"] == {
+        "q": 0.9,
+        "selected_language": "en-US",
+        "fallback": False,
+    }
+
+
+def test_q_stability_duplicates_keep_first_only():
+    response = _post_q_stability(
+        {
+            "accept_language": "en;q=0.8,en;q=0.1,zh;q=0.9",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ignored_duplicates"] == [{"range": "en", "position": 2}]
+    assert [(r["range"], r["position"]) for r in body["ranges"]] == [
+        ("en", 1),
+        ("zh", 3),
+    ]
+
+
+def test_q_stability_empty_header_ranges_empty():
+    response = _post_q_stability(
+        {"supported_languages": SUPPORTED, "default_language": DEFAULT}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["fallback"] is True
+    assert body["fallback_reason"] == "no-valid-range"
+    assert body["ranges"] == []
+
+
+def test_q_stability_locale_fallback_key_and_sweep():
+    response = _post_q_stability(
+        {
+            "accept_language": "gsw;q=0.9,fr;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {
+                "gsw": "de",
+                "de": "zh-TW",
+                "fr": "ja-JP",
+            },
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["locale_fallback"]["selected_language"] == "zh-TW"
+    by_range = {entry["range"]: entry for entry in body["ranges"]}
+    assert by_range["gsw"]["lower_outside"] == {
+        "q": 0.499,
+        "selected_language": "ja-JP",
+        "fallback": False,
+    }
+
+
+def test_q_stability_invalid_header_422():
+    response = _post_q_stability(
+        {
+            "accept_language": "en;q=2",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_q_stability_reuses_request_validation():
+    # Same 422 contract as the single negotiation endpoint.
+    response = _post_q_stability(
+        {
+            "accept_language": "en",
+            "supported_languages": SUPPORTED,
+            "default_language": "fr-FR",
+        }
+    )
+    assert response.status_code == 422
+    response = _post_q_stability(
+        {
+            "accept_language": "en",
+            "supported_languages": ["en"],
+            "default_language": "en",
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
 def _post_group(payload):
     return client.post("/api/v1/negotiate/group", json=payload)
 

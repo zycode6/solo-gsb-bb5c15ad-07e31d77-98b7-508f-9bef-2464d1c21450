@@ -7,6 +7,7 @@ from app.negotiation import (
     LocaleFallbackError,
     ParticipantHeaderError,
     SampleHeaderError,
+    analyze_q_stability,
     negotiate,
     negotiate_group,
     normalize_fallbacks,
@@ -647,3 +648,208 @@ class TestCoveragePlan:
         exc = excinfo.value
         assert isinstance(exc, AcceptLanguageError)
         assert exc.position == 2
+
+
+class TestQStability:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    @staticmethod
+    def _by_range(result):
+        return {entry["range"]: entry for entry in result["ranges"]}
+
+    def test_baseline_matches_plain_negotiate(self):
+        header = "zh-TW;q=0.95,zh;q=0.9,en;q=0.8,*;q=0.5"
+        baseline = negotiate(header, self.SUPPORTED, self.DEFAULT)
+        result = analyze_q_stability(header, self.SUPPORTED, self.DEFAULT)
+        for key in (
+            "selected_language",
+            "selected_supported_index",
+            "fallback",
+            "fallback_reason",
+            "message",
+            "parsed_ranges",
+            "ignored_duplicates",
+            "candidates",
+        ):
+            assert result[key] == baseline[key]
+
+    def test_interval_contains_original_q_and_grid_extrema_never_reported(self):
+        result = analyze_q_stability(
+            "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5", self.SUPPORTED, self.DEFAULT
+        )
+        by_range = self._by_range(result)
+        zh_cn = by_range["zh-cn"]
+        assert zh_cn["original_q"] == 1.0
+        assert zh_cn["lower_bound"] == 0.9
+        assert zh_cn["upper_bound"] == 1.0
+        # The original q always lies within its reported interval.
+        assert zh_cn["lower_bound"] <= 1.0 <= zh_cn["upper_bound"]
+        # Nothing beyond 1.000 exists on the grid.
+        assert zh_cn["upper_outside"] is None
+        assert zh_cn["lower_outside"] == {
+            "q": 0.899,
+            "selected_language": "zh-TW",
+            "fallback": False,
+        }
+
+    def test_irrelevant_range_stable_across_whole_grid(self):
+        # No wildcard and 'fr' matches no supported tag: sweeping fr can
+        # never change anything, and zh-CN is the sole positive match.
+        result = analyze_q_stability(
+            "zh-CN;q=1,fr;q=0.2", ["en-US", "zh-CN"], self.DEFAULT
+        )
+        by_range = self._by_range(result)
+        fr = by_range["fr"]
+        assert (fr["lower_bound"], fr["upper_bound"]) == (0.001, 1.0)
+        assert fr["lower_outside"] is None and fr["upper_outside"] is None
+        zh_cn = by_range["zh-cn"]
+        assert (zh_cn["lower_bound"], zh_cn["upper_bound"]) == (0.001, 1.0)
+        assert zh_cn["lower_outside"] is None and zh_cn["upper_outside"] is None
+
+    def test_upper_boundary_flips_winner(self):
+        # zh-CN matches the 'zh' range at 0.9 via truncation. At en=0.9
+        # the two tie but en-US is earlier in the server list, so the
+        # first differing point above the interval is q=0.9.
+        result = analyze_q_stability(
+            "zh;q=0.9,en;q=0.8,*;q=0.5", self.SUPPORTED, self.DEFAULT
+        )
+        en = self._by_range(result)["en"]
+        assert (en["lower_bound"], en["upper_bound"]) == (0.001, 0.899)
+        assert en["lower_outside"] is None
+        assert en["upper_outside"] == {
+            "q": 0.9,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_lower_boundary_flips_winner(self):
+        # zh must strictly beat the wildcard's 0.4; the first differing
+        # point below the interval is q=0.4 (wildcard candidate wins).
+        result = analyze_q_stability(
+            "zh;q=0.9,*;q=0.4", self.SUPPORTED, self.DEFAULT
+        )
+        zh = self._by_range(result)["zh"]
+        assert (zh["lower_bound"], zh["upper_bound"]) == (0.401, 1.0)
+        assert zh["lower_outside"] == {
+            "q": 0.4,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+        assert zh["upper_outside"] is None
+
+    def test_wildcard_range_is_swept_like_any_range(self):
+        # Raising the wildcard from 0.4 to 0.9 lets en-US beat zh-CN.
+        result = analyze_q_stability(
+            "zh;q=0.9,*;q=0.4", self.SUPPORTED, self.DEFAULT
+        )
+        star = self._by_range(result)["*"]
+        assert star["position"] == 2
+        assert (star["lower_bound"], star["upper_bound"]) == (0.001, 0.899)
+        assert star["upper_outside"] == {
+            "q": 0.9,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_original_q_zero_interval_starts_at_zero(self):
+        # en is excluded in the baseline (zh-CN wins). Any positive en q
+        # strictly below 0.9 leaves zh-CN in charge; at 0.9 en-US ties
+        # zh-CN and wins by earlier server position.
+        result = analyze_q_stability(
+            "en;q=0,zh;q=0.9", self.SUPPORTED, self.DEFAULT
+        )
+        en = self._by_range(result)["en"]
+        assert en["original_q"] == 0.0
+        assert en["lower_bound"] == 0.0
+        assert en["upper_bound"] == 0.899
+        assert en["lower_outside"] is None
+        assert en["upper_outside"] == {
+            "q": 0.9,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_original_q_zero_flips_at_first_positive_grid_point(self):
+        # *;q=0 excludes everything (default fallback); any positive
+        # wildcard makes the first supported tag a normal hit.
+        result = analyze_q_stability("*;q=0", self.SUPPORTED, self.DEFAULT)
+        star = self._by_range(result)["*"]
+        assert (star["lower_bound"], star["upper_bound"]) == (0.0, 0.0)
+        assert star["lower_outside"] is None
+        assert star["upper_outside"] == {
+            "q": 0.001,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_original_q_zero_stays_stable_through_whole_grid(self):
+        # de matches nothing: whether excluded (q=0) or positive, the
+        # outcome is always the default fallback.
+        result = analyze_q_stability("de;q=0", self.SUPPORTED, self.DEFAULT)
+        de = self._by_range(result)["de"]
+        assert (de["lower_bound"], de["upper_bound"]) == (0.0, 1.0)
+        assert de["lower_outside"] is None and de["upper_outside"] is None
+
+    def test_reports_use_deduplicated_ranges_in_header_order(self):
+        # The second en element is an ignored duplicate; sweeping only
+        # touches the first occurrence, and the report lists de-duplicated
+        # ranges with their original positions.
+        result = analyze_q_stability(
+            "en;q=0.8,en;q=0.1,zh;q=0.9", self.SUPPORTED, self.DEFAULT
+        )
+        assert [(r["range"], r["position"]) for r in result["ranges"]] == [
+            ("en", 1),
+            ("zh", 3),
+        ]
+        en = self._by_range(result)["en"]
+        assert en["upper_outside"] == {
+            "q": 0.9,
+            "selected_language": "en-US",
+            "fallback": False,
+        }
+
+    def test_no_ranges_yields_empty_report(self):
+        for header in (None, "", "   "):
+            result = analyze_q_stability(header, self.SUPPORTED, self.DEFAULT)
+            assert result["ranges"] == []
+            assert result["fallback"] is True
+
+    def test_truncation_match_semantics_reused(self):
+        # zh-TW truncates to zh; lowering zh below the wildcard flips the
+        # winner via ordinary lookup rules, not a special-cased matrix.
+        result = analyze_q_stability(
+            "zh;q=0.9,*;q=0.8", self.SUPPORTED, self.DEFAULT
+        )
+        zh = self._by_range(result)["zh"]
+        assert zh["lower_bound"] == 0.801
+        assert zh["lower_outside"]["selected_language"] == "en-US"
+
+    def test_locale_fallback_baseline_and_probes(self):
+        chains = {
+            "gsw": "de",
+            "de": "zh-TW",
+            "fr": "ja-JP",
+        }
+        result = analyze_q_stability(
+            "gsw;q=0.9,fr;q=0.5",
+            self.SUPPORTED,
+            self.DEFAULT,
+            chains,
+        )
+        # Baseline came through the chain fallback, fallback=false.
+        assert result["selected_language"] == "zh-TW"
+        assert result["fallback"] is False
+        assert result["locale_fallback"]["source_range"] == "gsw"
+        gsw = self._by_range(result)["gsw"]
+        # gsw below fr's 0.5 makes fr's chain (-> ja-JP) win; the tie at
+        # 0.5 keeps header order, so the flip is at 0.499.
+        assert gsw["lower_outside"] == {
+            "q": 0.499,
+            "selected_language": "ja-JP",
+            "fallback": False,
+        }
+
+    def test_invalid_header_raises_existing_error(self):
+        with pytest.raises(AcceptLanguageError):
+            analyze_q_stability("en;q=2", self.SUPPORTED, self.DEFAULT)

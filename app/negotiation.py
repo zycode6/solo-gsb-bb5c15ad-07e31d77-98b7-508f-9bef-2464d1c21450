@@ -30,7 +30,15 @@ Implements the negotiation rules required by the service:
   subset of up to ``max_additions`` new languages; the subset moving
   the most traffic from the default fallback to a normal hit wins,
   ties broken by fewer additions, then by earlier candidate input
-  order.
+  order;
+* :func:`analyze_q_stability` also reuses :func:`negotiate` unchanged:
+  after a baseline negotiation it sweeps, for each de-duplicated
+  language range on its own, every RFC 9110 positive three-decimal q
+  grid value (0.001-1.000; ``q=0`` stays excluded) while all other
+  ranges stay byte-for-byte as sent, and reports the maximal
+  contiguous grid interval containing the original q on which the
+  selected language and fallback state never change, plus the first
+  grid point beyond each boundary when one exists.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -834,4 +842,177 @@ def plan_coverage(
         "improved_traffic": best_improved,
         "message": message,
         "samples": sample_reports,
+    }
+
+
+# RFC 9110 q values are three-decimal fractions of 0.001 between 0 and 1.
+# The stability sweep covers the positive half of that grid only: q=0 is
+# the exclusion value and is never a sweep point.
+_Q_GRID_STEP = 0.001
+_Q_GRID_SIZE = 1000
+
+
+def _grid_index(q: float) -> int:
+    """Map a parsed q value to its 0-based index on the 0.001-spaced grid.
+
+    Parser output always originates from the ``0``/``0.xxx``/``1.000``
+    grammar, so round() only absorbs binary float noise.
+    """
+
+    return round(q * _Q_GRID_SIZE)
+
+
+def _grid_q(index: int) -> float:
+    return round(index * _Q_GRID_STEP, 3)
+
+
+def _replace_range_q(
+    header: str | None, position: int, q_index: int
+) -> str | None:
+    """Rebuild a header with one element's q replaced by a grid value.
+
+    Every element other than the one at 1-based ``position`` is kept
+    byte-for-byte as the client sent it (so untouched duplicate
+    occurrences stay ignored duplicates). The target element keeps its
+    exact tag text and is given a canonical ``;q=0.xxx`` parameter,
+    replacing whatever q parameters it originally carried.
+    """
+
+    if header is None:
+        return header
+    elements = header.split(",")
+    element = elements[position - 1]
+    parts = element.split(";")
+    tag = parts[0]
+    elements[position - 1] = f"{tag};q={_grid_q(q_index):.3f}"
+    return ",".join(elements)
+
+
+def analyze_q_stability(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Analyze how stable the negotiation outcome is to each range's q.
+
+    First runs the ordinary :func:`negotiate` rules to obtain the
+    baseline. Then, for every de-duplicated language range
+    independently, the range alone is swept over the positive RFC 9110
+    q grid (0.001 through 1.000, three decimals; ``q=0`` is excluded)
+    while every other range stays exactly as sent; each probe is a full
+    :func:`negotiate` call, so wildcard precedence, truncation lookup
+    and q=0 exclusion all behave exactly as in the baseline.
+
+    The probe results determine the maximal contiguous grid interval
+    that contains the range's original q and on which both
+    ``selected_language`` and ``fallback`` remain identical to the
+    baseline. When a grid point exists directly beyond an interval
+    boundary, its new ``selected_language``/``fallback`` is reported
+    too. For a range whose original q is 0 (a value not on the sweep
+    grid), the interval's lower bound is 0.0 and the baseline outcome
+    at q=0 is known to be stable by definition.
+    """
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    baseline_key = (baseline["selected_language"], baseline["fallback"])
+    parsed = parse_accept_language(header)
+
+    def probe(q_index: int, position: int) -> tuple[str, bool]:
+        outcome = negotiate(
+            header=_replace_range_q(header, position, q_index),
+            supported=supported,
+            default=default,
+            locale_fallbacks=locale_fallbacks,
+        )
+        return outcome["selected_language"], outcome["fallback"]
+
+    ranges_report: list[dict[str, Any]] = []
+    for entry in parsed:
+        original_index = _grid_index(entry.q)
+
+        # Cache one probe per positive grid point (q = k * 0.001,
+        # k in 1..1000). q=0 itself is not swept: for an originally-zero
+        # range the baseline result at k=0 is known to match by
+        # construction, so the stable interval may start at 0.0.
+        probes: dict[int, tuple[str, bool]] = {}
+
+        def outcome_at(k: int) -> tuple[str, bool]:
+            if k not in probes:
+                probes[k] = probe(k, entry.position)
+            return probes[k]
+
+        def is_stable(k: int) -> bool:
+            selected, fell_back = outcome_at(k)
+            return (selected, fell_back) == baseline_key
+
+        def outside_report(q_index: int) -> dict[str, Any]:
+            selected, fell_back = outcome_at(q_index)
+            return {
+                "q": _grid_q(q_index),
+                "selected_language": selected,
+                "fallback": fell_back,
+            }
+
+        if entry.q == 0:
+            lower_index = 0
+            lower_outside = None
+            # Largest prefix of the positive grid that stays identical
+            # to the q=0 baseline; the first differing point, if any, is
+            # the point just beyond the upper bound.
+            upper_index = 0
+            for k in range(1, _Q_GRID_SIZE + 1):
+                if is_stable(k):
+                    upper_index = k
+                else:
+                    break
+            upper_outside = (
+                outside_report(upper_index + 1)
+                if upper_index < _Q_GRID_SIZE
+                else None
+            )
+        else:
+            lower_index = original_index
+            while lower_index > 1 and is_stable(lower_index - 1):
+                lower_index -= 1
+            upper_index = original_index
+            while upper_index < _Q_GRID_SIZE and is_stable(upper_index + 1):
+                upper_index += 1
+            lower_outside = (
+                outside_report(lower_index - 1) if lower_index > 1 else None
+            )
+            upper_outside = (
+                outside_report(upper_index + 1)
+                if upper_index < _Q_GRID_SIZE
+                else None
+            )
+
+        ranges_report.append(
+            {
+                "range": entry.range,
+                "position": entry.position,
+                "original_q": entry.q,
+                "lower_bound": _grid_q(lower_index),
+                "upper_bound": _grid_q(upper_index),
+                "lower_outside": lower_outside,
+                "upper_outside": upper_outside,
+            }
+        )
+
+    return {
+        "selected_language": baseline["selected_language"],
+        "selected_supported_index": baseline["selected_supported_index"],
+        "fallback": baseline["fallback"],
+        "fallback_reason": baseline["fallback_reason"],
+        "message": baseline["message"],
+        "parsed_ranges": baseline["parsed_ranges"],
+        "ignored_duplicates": baseline["ignored_duplicates"],
+        "candidates": baseline["candidates"],
+        "locale_fallback": baseline["locale_fallback"],
+        "ranges": ranges_report,
     }

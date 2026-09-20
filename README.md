@@ -11,7 +11,10 @@ BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4
 traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷举所有不超过
 `max_additions`（1～3）个新增的候选子集，复用同一套协商语义计算每个子集可将多少
 流量从默认兜底转为正常命中，选出改善流量最大的方案（同分依次取新增数更少、
-候选输入序更早）。
+候选输入序更早）。`/api/v1/negotiate/q-stability` 提供**偏好权重稳定区间分析**：
+沿用单人协商请求体，先得到基准协商结果，再对去重后的每个语言范围单独扫描 RFC
+允许的 `0.001`～`1.000` 三位小数 q 网格（`q=0` 不参与扫描），给出选中语言与
+回退状态保持不变的最大连续 q 区间，以及边界外首个网格点的新结果。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -27,6 +30,7 @@ docker compose up -d --build
 | --- | --- |
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/q-stability | 偏好权重稳定区间分析接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
@@ -354,6 +358,89 @@ curl -X POST http://localhost:8000/api/v1/negotiate/coverage-plan \
 `accept_language.syntax_error`），以及沿用单人接口的
 `supported_languages` / `default_language` 校验。
 
+## 偏好权重稳定区间分析（POST /api/v1/negotiate/q-stability）
+
+当需要回答「某个语言范围的 q 值在多大范围内微调，不会改变最终协商结果」时，使用
+稳定区间分析接口。**请求体与单人协商接口完全相同**（含可选的
+`locale_fallbacks`）；服务端先按现有规则跑出**基准结果**，再对去重后的每个语言
+范围单独做 q 网格扫描，扫描时其余范围**原样保持不变**（包括仍会被忽略的重复
+出现）。
+
+扫描网格为 RFC 9110 允许的三位小数 q 值 **`0.001`～`1.000`（步长 0.001，共
+1000 个点）**；**`q=0` 不参与扫描**（它是排除值，不是可调权重）。每个网格点都
+走一次完整的单人协商，因此通配符优先级、逐级截断匹配与 `q=0` 排除规则与基准完全
+一致。对每个范围求出：
+
+- **包含原 q 的最大连续稳定区间**：区间内每个网格点的 `selected_language` 与
+  `fallback` 状态都与基准相同；响应给出区间 `lower_bound` / `upper_bound` 以及
+  该范围的原始位置 `position`（1 起，头中序号）与 `original_q`。
+- **边界外首点**：边界之外若仍存在网格点，则在 `lower_outside` /
+  `upper_outside` 中给出该点的 `q` 以及它对应的**新 `selected_language` 与
+  `fallback`**；边界已到网格边缘（下界 `0.001` 之外、上界为 `1.000`）时对应
+  字段为 `null`。
+- 原 q 本身为 `0` 的范围，其稳定区间下界为 `0.0`、`lower_outside` 恒为 `null`；
+  若把它提到任意正 q 都会改变结果（如 `*;q=0`），区间退化为 `[0.0, 0.0]`，
+  `upper_outside` 指向 `0.001` 的新结果。
+- 头缺失/`null`/空白时没有语言范围，`ranges` 为空数组，基准部分照常返回
+  `no-valid-range` 兜底结果。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/q-stability \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US"
+  }'
+```
+
+响应（节选；基准字段与 `/api/v1/negotiate` 完全一致，新增 `ranges`）：
+
+```json
+{
+  "selected_language": "zh-CN",
+  "selected_supported_index": 1,
+  "fallback": false,
+  "fallback_reason": null,
+  "ranges": [
+    {"range": "zh-cn", "position": 1, "original_q": 1.0,
+     "lower_bound": 0.9, "upper_bound": 1.0,
+     "lower_outside": {"q": 0.899, "selected_language": "zh-TW", "fallback": false},
+     "upper_outside": null},
+    {"range": "zh", "position": 2, "original_q": 0.9,
+     "lower_bound": 0.001, "upper_bound": 1.0,
+     "lower_outside": null, "upper_outside": null},
+    {"range": "en", "position": 3, "original_q": 0.8,
+     "lower_bound": 0.001, "upper_bound": 0.999,
+     "lower_outside": null,
+     "upper_outside": {"q": 1.0, "selected_language": "en-US", "fallback": false}},
+    {"range": "*", "position": 4, "original_q": 0.5,
+     "lower_bound": 0.001, "upper_bound": 1.0,
+     "lower_outside": null, "upper_outside": null}
+  ]
+}
+```
+
+含义示例：`zh-CN` 范围的 q 只要不低于 `0.9`，选中结果就一直是 `zh-CN`；一旦降到
+`0.899`，`zh-TW`（命中 `zh;q=0.9`）取而代之。通配符 `*` 的 q 无论怎么调都不改变
+结果（它始终只给未命中具体范围的候选计权），因此区间覆盖整个网格、两侧均无边界外
+点。
+
+### `ranges[]` 字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `range` | 去重后的语言范围（小写；通配符为 `*`） |
+| `position` | 该范围在原始 `Accept-Language` 头中的序号（从 1 开始） |
+| `original_q` | 该范围在原始请求中的 q 值（可能为 `0`） |
+| `lower_bound` / `upper_bound` | 包含原 q 的最大连续稳定区间上下界（三位小数；原 q=0 的范围下界为 `0.0`） |
+| `lower_outside` / `upper_outside` | 边界外紧邻网格点的 `{q, selected_language, fallback}`；无该网格点时为 `null` |
+
+校验与单人接口完全一致：非法 `accept_language` 返回 **HTTP 422**，`loc` 为
+`["body","accept_language"]`、`type` 为 `accept_language.syntax_error`；
+`supported_languages` / `default_language` / `locale_fallbacks` 等校验同样沿用。
+`locale_fallback` 键的省略规则也与单人接口一致：链未选中语言时该键整体缺省。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -441,7 +528,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 114 个单元/接口测试
+pytest -q          # 136 个单元/接口测试
 ```
 
 ## 项目结构

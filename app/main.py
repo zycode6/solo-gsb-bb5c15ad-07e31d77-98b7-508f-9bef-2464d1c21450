@@ -10,6 +10,7 @@ from .negotiation import (
     AcceptLanguageError,
     ParticipantHeaderError,
     SampleHeaderError,
+    analyze_q_stability,
     negotiate,
     negotiate_group,
     plan_coverage,
@@ -22,6 +23,7 @@ from .schemas import (
     HealthResponse,
     NegotiationRequest,
     NegotiationResponse,
+    QStabilityResponse,
 )
 app = FastAPI(
     title="HTTP 语言协商解释 API",
@@ -33,6 +35,9 @@ app = FastAPI(
         "另提供 /api/v1/negotiate/group 群体协商：对多位参与者逐人复用相同的"
         "匹配语义构成权重矩阵，具体范围 q=0 全局否决，按最低个人权重 → 总权重 → "
         "服务端顺序选出共同接受的语言。"
+        "/api/v1/negotiate/q-stability 在普通协商基准之上，对去重后的每个语言范围"
+        "单独扫描 0.001～1.000 三位小数 q 网格（q=0 不扫描），给出选中语言与"
+        "回退状态保持不变的最大连续区间及边界外首点的新结果。"
     ),
     version=__version__,
 )
@@ -143,6 +148,32 @@ async def negotiate_language(
 
 
 @app.post(
+    "/api/v1/negotiate/q-stability",
+    response_model=QStabilityResponse,
+    tags=["语言协商"],
+    summary="各语言范围 q 权重稳定区间分析",
+)
+async def negotiate_q_stability(
+    payload: NegotiationRequest,
+) -> JSONResponse:
+    # Request shape is identical to the single negotiation endpoint;
+    # an invalid header surfaces through the same 422 handler below.
+    result = analyze_q_stability(
+        header=payload.accept_language,
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        locale_fallbacks=payload.locale_fallbacks,
+    )
+    response = QStabilityResponse.model_validate(result)
+    if response.locale_fallback is None:
+        # Match the negotiate endpoint's key-omission contract.
+        payload_body = response.model_dump(exclude={"locale_fallback"})
+    else:
+        payload_body = response.model_dump()
+    return JSONResponse(content=payload_body)
+
+
+@app.post(
     "/api/v1/negotiate/group",
     response_model=GroupNegotiationResponse,
     tags=["语言协商"],
@@ -186,5 +217,6 @@ async def root() -> dict[str, str]:
         "docs": "/docs",
         "health": "/health",
         "negotiate": "POST /api/v1/negotiate",
+        "negotiate_q_stability": "POST /api/v1/negotiate/q-stability",
         "negotiate_group": "POST /api/v1/negotiate/group",
     }
