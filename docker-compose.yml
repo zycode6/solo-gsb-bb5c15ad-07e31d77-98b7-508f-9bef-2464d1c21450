@@ -1,0 +1,18 @@
+services:
+  language-negotiator:
+    build: .
+    image: language-negotiator:latest
+    container_name: language-negotiator
+    ports:
+      - "8000:8000"
+    environment:
+      # Uvicorn tuning; defaults are fine for local use.
+      UVICORN_WORKERS: "2"
+      LOG_LEVEL: "info"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
